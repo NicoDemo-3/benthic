@@ -93,6 +93,13 @@ ul.list{list-style:none; margin:0; padding:0}
 .item.done .title{text-decoration:line-through; text-decoration-color:var(--teal); text-decoration-thickness:2px}
 .item.done .title, .item.done .artist{opacity:.6}
 .empty{color:var(--muted); padding:18px 0}
+.tools{margin:0 0 18px}
+.tools h2{font-size:1.1rem}
+.tools .row{margin-top:10px}
+.tools input[type=text]{flex:1; min-width:180px}
+.tools details{margin:12px 0 0}
+.tools ul{margin:8px 0 0; padding-left:1.2em; font-size:15px; max-height:240px; overflow:auto}
+.tools a{color:var(--pink); font-weight:700; text-underline-offset:3px}
 footer{color:var(--muted); font-size:14px; margin-top:36px}
 @media (prefers-reduced-motion: reduce){.bar i{transition:none}}
 </style>
@@ -108,7 +115,7 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
     <ol class="how">
       <li>Sign in at developer.tidal.com and create an app.</li>
       <li>In the app settings, add this exact redirect URI: <code id="redir"></code></li>
-      <li>Turn on the scopes <code>user.read</code>, <code>playlists.read</code> and <code>collection.read</code>.</li>
+      <li>Turn on the scopes <code>user.read</code>, <code>playlists.read</code>, <code>collection.read</code>, <code>search.read</code> and <code>playlists.write</code>. The last two let the page match an uploaded list on Tidal and save it as a playlist.</li>
       <li>Copy the app's client ID and paste it here. The client secret isn't needed.</li>
     </ol>
     <input type="text" id="clientId" placeholder="Tidal client ID" autocomplete="off" spellcheck="false" aria-label="Tidal client ID">
@@ -166,6 +173,20 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
       </div>
     </div>
     <div class="bar" aria-hidden="true"><i id="bar"></i></div>
+    <div class="panel tools" aria-labelledby="h-tools">
+      <h2 id="h-tools">Use this list with Tidal</h2>
+      <p class="msg" style="margin-top:0">Each song is looked up on Tidal by artist and title. Songs already loaded from Tidal skip the search.</p>
+      <div class="row">
+        <button id="getCovers">Get album covers</button>
+      </div>
+      <div class="row">
+        <input type="text" id="newPlName" placeholder="Playlist name" aria-label="New Tidal playlist name">
+        <button class="primary" id="makePl">Save as Tidal playlist</button>
+      </div>
+      <label class="msg" style="display:flex; gap:6px; align-items:center"><input type="checkbox" id="plSkipBought"> Leave out songs I've bought</label>
+      <p class="msg" id="toolMsg" role="status"></p>
+      <details id="noMatch" hidden><summary></summary><ul id="noMatchList"></ul></details>
+    </div>
     <ul class="list" id="list"></ul>
     <div class="row"><button id="csv">Download CSV</button><button class="link" id="clear">Clear this list</button></div>
   </section>
@@ -181,7 +202,7 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
   const API = "https://openapi.tidal.com/v2";
   const AUTH_URL = "https://login.tidal.com/authorize";
   const TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token";
-  const SCOPES = "user.read playlists.read collection.read";
+  const SCOPES = "user.read playlists.read collection.read search.read playlists.write";
   const KEY = "t2b-list-v1", AUTH_KEY = "t2b-auth-v1", ID_KEY = "t2b-client-id";
 
   const $ = id => document.getElementById(id);
@@ -254,12 +275,15 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
 
   /* ---------- Tidal API ---------- */
   let country = "US";
-  async function api(path, params){
+  async function api(path, params, opts){
+    opts = opts || {};
     const auth = getAuth();
     if(!auth){ showStep(); throw new Error("Your Tidal session expired. Sign in again."); }
     const url = API + path + (params ? "?" + new URLSearchParams(params) : "");
     for(let attempt = 0; attempt < 4; attempt++){
-      const r = await fetch(url, {headers:{Authorization:"Bearer " + auth.token, Accept:"application/vnd.api+json"}});
+      const headers = {Authorization:"Bearer " + auth.token, Accept:"application/vnd.api+json"};
+      if(opts.body) headers["Content-Type"] = "application/vnd.api+json";
+      const r = await fetch(url, {method:opts.method || "GET", headers, body:opts.body ? JSON.stringify(opts.body) : undefined});
       if(r.status === 429){
         const wait = (parseFloat(r.headers.get("Retry-After")) || 2 + attempt * 2) * 1000;
         say("Tidal asked us to slow down. Waiting " + Math.round(wait/1000) + "s…");
@@ -347,6 +371,7 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
         const albRef = rel.albums && rel.albums.data && rel.albums.data[0];
         const alb = albRef && inc.get("albums:" + albRef.id);
         list.push({
+          tidalId: t.id,
           title: (a.title || "Untitled") + (a.version ? " (" + a.version + ")" : ""),
           artist: artists.join(", "),
           album: alb ? alb.attributes.title : "",
@@ -362,6 +387,144 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
     }finally{
       document.querySelectorAll("#playlists button").forEach(b => b.disabled = false);
     }
+  }
+
+  /* ---------- Matching an uploaded list on Tidal ---------- */
+  // Compare titles and names loosely: no accents, no "(2011 Remaster)", no " - Guitar", no "feat."
+  const norm = s => (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/\(.*?\)|\[.*?\]/g, " ").replace(/\s(feat|ft)\.?\s.*$/, "").split(" - ")[0]
+    .replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const close = (a, b) => !!a && !!b && (a === b || (Math.min(a.length, b.length) >= 3 && (a.includes(b) || b.includes(a))));
+  const tidalSearchLink = t => "https://tidal.com/search?q=" + encodeURIComponent((firstArtist(t.artist) + " " + t.title).trim());
+
+  function toolSay(text, err){ const m = $("toolMsg"); m.textContent = text || ""; m.className = "msg" + (err ? " err" : ""); }
+  function scopeHelp(e){
+    return e && (e.status === 403 || e.status === 401)
+      ? "Tidal didn't allow that. In your Tidal app, turn on the search.read and playlists.write scopes, then sign out and sign in again."
+      : "Tidal error: " + (e && e.message);
+  }
+  function needSignIn(){
+    if(getAuth()) return false;
+    toolSay("Sign in with Tidal first, at the top of the page.", true);
+    const target = $("signin").hidden ? $("setup") : $("signin");
+    if(!target.hidden) target.scrollIntoView({behavior:"smooth"});
+    return true;
+  }
+
+  // Fetch artist/album/cover details for up to 20 tracks per request
+  async function trackDetails(ids){
+    const out = new Map();
+    for(let i = 0; i < ids.length; i += 20){
+      const batch = ids.slice(i, i + 20);
+      let j = null;
+      for(const inc of ["artists,albums,albums.coverArt", "artists,albums"]){
+        const p = new URLSearchParams({countryCode:country, include:inc});
+        batch.forEach(id => p.append("filter[id]", id));
+        try{ j = await api("/tracks", p); break; }
+        catch(e){ if(e.status !== 400) throw e; }
+      }
+      if(!j) continue;
+      const inc = new Map((j.included || []).map(x => [x.type + ":" + x.id, x]));
+      (j.data || []).forEach(t => {
+        const rel = t.relationships || {};
+        const artists = ((rel.artists && rel.artists.data) || []).map(r => inc.get("artists:" + r.id)).filter(Boolean).map(x => x.attributes.name);
+        const albRef = rel.albums && rel.albums.data && rel.albums.data[0];
+        const alb = albRef && inc.get("albums:" + albRef.id);
+        out.set(t.id, {title:(t.attributes && t.attributes.title) || "", artists, albumId: albRef ? albRef.id : "", album: alb ? alb.attributes.title : "", cover: coverOf(alb, inc)});
+      });
+    }
+    return out;
+  }
+
+  // Find a Tidal track id for every song that doesn't have one yet. Results are saved, so this only runs once per song.
+  async function matchAll(){
+    const todo = tracks.filter(t => !t.tidalId && !t.noMatch);
+    const cands = new Map();
+    for(let i = 0; i < todo.length; i++){
+      const t = todo[i];
+      toolSay("Searching Tidal… " + (i + 1) + " of " + todo.length);
+      const q = (firstArtist(t.artist) + " " + t.title.replace(/\(.*?\)|\[.*?\]/g, " ")).replace(/[\/\\]/g, " ").replace(/\s+/g, " ").trim();
+      try{
+        const j = await api("/searchResults/" + encodeURIComponent(q) + "/relationships/tracks", {countryCode:country});
+        cands.set(t, (j.data || []).filter(x => x.type === "tracks").slice(0, 5).map(x => x.id));
+      }catch(e){
+        if(e.status === 404){ cands.set(t, []); continue; }
+        throw e;
+      }
+    }
+    // Check the candidates' real titles and artists before accepting one
+    const ids = [...new Set([...cands.values()].flat())];
+    if(ids.length) toolSay("Checking " + ids.length + " possible matches…");
+    const info = await trackDetails(ids);
+    cands.forEach((list, t) => {
+      const want = norm(t.title), artists = (t.artist || "").split(", ").map(norm).filter(Boolean);
+      const hit = list.find(id => {
+        const d = info.get(id); if(!d) return false;
+        const titleOk = close(norm(d.title), want);
+        const artistOk = !artists.length || d.artists.some(a => artists.some(b => close(norm(a), b)));
+        return titleOk && artistOk;
+      });
+      if(hit){
+        const d = info.get(hit);
+        t.tidalId = hit; delete t.noMatch;
+        if(!t.album && d.album) t.album = d.album;
+        if(!t.albumId) t.albumId = d.albumId;
+        if(!t.cover && d.cover) t.cover = d.cover;
+      } else t.noMatch = true;
+    });
+    saveList(); render(); showNoMatch();
+  }
+
+  function showNoMatch(){
+    const miss = tracks.filter(t => t.noMatch);
+    $("noMatch").hidden = !miss.length;
+    if(!miss.length) return;
+    $("noMatch").querySelector("summary").textContent = miss.length + (miss.length === 1 ? " song" : " songs") + " not found on Tidal";
+    $("noMatchList").innerHTML = miss.map(t => '<li>' + esc((t.artist ? t.artist + " - " : "") + t.title) + ' ' +
+      link(tidalSearchLink(t), "Search Tidal") + '</li>').join("");
+  }
+
+  async function runTool(btn, fn){
+    if(needSignIn()) return;
+    const btns = [$("getCovers"), $("makePl")];
+    btns.forEach(b => b.disabled = true);
+    try{ await fn(); }
+    catch(e){ toolSay(scopeHelp(e), true); }
+    finally{ btns.forEach(b => b.disabled = false); }
+  }
+
+  async function getCovers(){
+    await matchAll();
+    await fillCovers();
+    const have = tracks.filter(t => t.cover).length, miss = tracks.filter(t => t.noMatch).length;
+    toolSay("Covers found for " + have + " of " + tracks.length + " songs." + (miss ? " " + miss + " couldn't be matched; see the list below." : ""));
+  }
+
+  async function makePlaylist(){
+    const name = $("newPlName").value.trim() || label || "Shopping list";
+    await matchAll();
+    const skip = $("plSkipBought").checked;
+    const ids = [...new Set(tracks.filter(t => t.tidalId && !(skip && bought[idOf(t)])).map(t => t.tidalId))];
+    if(!ids.length){ toolSay("None of these songs were found on Tidal, so there's nothing to add.", true); return; }
+    toolSay("Creating the playlist…");
+    const attrs = {name, description:"Made with the Tidal to Bandcamp shopping list"};
+    let made;
+    try{ made = await api("/playlists", null, {method:"POST", body:{data:{type:"playlists", attributes:Object.assign({accessType:"UNLISTED"}, attrs)}}}); }
+    catch(e){
+      if(e.status !== 400) throw e;
+      made = await api("/playlists", null, {method:"POST", body:{data:{type:"playlists", attributes:attrs}}});
+    }
+    const pid = made && made.data && made.data.id;
+    if(!pid) throw new Error("Tidal didn't return the new playlist");
+    for(let i = 0; i < ids.length; i += 20){
+      toolSay("Adding songs… " + Math.min(i + 20, ids.length) + " of " + ids.length);
+      await api("/playlists/" + pid + "/relationships/items", null, {method:"POST", body:{data:ids.slice(i, i + 20).map(id => ({id, type:"tracks"}))}});
+    }
+    const url = (made.data.attributes && made.data.attributes.tidalUrl) || "https://tidal.com/browse/playlist/" + pid;
+    const miss = tracks.filter(t => t.noMatch).length;
+    $("toolMsg").className = "msg";
+    $("toolMsg").innerHTML = 'Saved "' + esc(name) + '" with ' + ids.length + ' songs. ' + link(url, "Open in Tidal") +
+      (miss ? ' ' + miss + " couldn't be matched; see the list below." : "");
   }
 
   /* ---------- Album covers ---------- */
@@ -541,10 +704,11 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
   }
 
   function setTracks(list, name){
+    $("newPlName").value = name || ""; toolSay("");
     const seen = new Set();
     tracks = list.filter(t => { const k = idOf(t); if(seen.has(k)) return false; seen.add(k); return true; });
     label = name || "";
-    saveList(); render();
+    saveList(); render(); showNoMatch();
     say(tracks.length ? "" : "No tracks found. Paste one track per line, or upload a CSV or TXT export.", !tracks.length);
     if(tracks.length) $("results").scrollIntoView({behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"});
   }
@@ -573,6 +737,8 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
   });
   // Export every track (ignores "Hide bought" and grouping), in playlist order.
   // Columns match what the paste/upload parser reads, so the file can be loaded back in.
+  $("getCovers").addEventListener("click", () => runTool($("getCovers"), getCovers));
+  $("makePl").addEventListener("click", () => runTool($("makePl"), makePlaylist));
   $("csv").addEventListener("click", () => {
     if(!tracks.length) return;
     const cell = v => { v = String(v == null ? "" : v); return /[",\r\n]/.test(v) || /^\s|\s$/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
@@ -595,7 +761,7 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
   });
   $("clear").addEventListener("click", () => {
     if(!confirm("Clear this list and your bought ticks?")) return;
-    tracks = []; bought = {}; label = ""; saveList(); render();
+    tracks = []; bought = {}; label = ""; saveList(); render(); showNoMatch(); toolSay("");
   });
   $("list").addEventListener("change", e => {
     const id = e.target.dataset && e.target.dataset.id; if(!id) return;
@@ -607,7 +773,7 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
 
   /* ---------- Start ---------- */
   (async function start(){
-    loadList(); render();
+    loadList(); render(); showNoMatch(); $("newPlName").value = label;
     if(location.protocol === "file:") say("Open this page from its GitHub Pages address; Tidal sign-in won't work from a local file.", true);
     await handleCallback();
     const {auth} = showStep();
