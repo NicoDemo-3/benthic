@@ -185,7 +185,7 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
       </div>
       <label class="msg" style="display:flex; gap:6px; align-items:center"><input type="checkbox" id="plSkipBought"> Leave out songs I've bought</label>
       <p class="msg" id="toolMsg" role="status"></p>
-      <details id="noMatch" hidden><summary></summary><ul id="noMatchList"></ul></details>
+      <details id="noMatch" hidden><summary></summary><ul id="noMatchList"></ul><div class="row"><button class="link" id="retryMiss">Search for these again next time</button></div></details>
     </div>
     <ul class="list" id="list"></ul>
     <div class="row"><button id="csv">Download CSV</button><button class="link" id="clear">Clear this list</button></div>
@@ -440,17 +440,38 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
   async function matchAll(){
     const todo = tracks.filter(t => !t.tidalId && !t.noMatch);
     const cands = new Map();
+    let rejected = 0, lastErr = null;
     for(let i = 0; i < todo.length; i++){
       const t = todo[i];
       toolSay("Searching Tidal… " + (i + 1) + " of " + todo.length);
-      const q = (firstArtist(t.artist) + " " + t.title.replace(/\(.*?\)|\[.*?\]/g, " ")).replace(/[\/\\]/g, " ").replace(/\s+/g, " ").trim();
-      try{
-        const j = await api("/searchResults/" + encodeURIComponent(q) + "/relationships/tracks", {countryCode:country});
-        cands.set(t, (j.data || []).filter(x => x.type === "tracks").slice(0, 5).map(x => x.id));
-      }catch(e){
-        if(e.status === 404){ cands.set(t, []); continue; }
-        throw e;
+      // Tidal rejects some symbols in search terms, so search with letters, numbers and spaces only.
+      // "$" becomes "s" so names like Chri$tian Gate$ still find the artist.
+      const clean = s => (s || "").replace(/\(.*?\)|\[.*?\]/g, " ").replace(/\$/g, "s")
+        .replace(/[^\p{L}\p{N}\s]+/gu, " ").replace(/\s+/g, " ").trim();
+      const title = clean(t.title), artist = clean(firstArtist(t.artist));
+      const queries = [...new Set([(artist + " " + title).trim(), title].filter(Boolean))];
+      let found = [], ok = false;
+      for(const q of queries){
+        try{
+          const j = await api("/searchResults/" + encodeURIComponent(q) + "/relationships/tracks", {countryCode:country});
+          ok = true;
+          found = (j.data || []).filter(x => x.type === "tracks").slice(0, 5).map(x => x.id);
+          if(found.length) break;
+        }catch(e){
+          // A bad search term only skips this song; sign-in and permission problems stop the run
+          if(e.status === 400 || e.status === 404 || e.status === 422){ lastErr = e; continue; }
+          e.message = e.message + ' (while searching for "' + (t.artist ? t.artist + " - " : "") + t.title + '")';
+          throw e;
+        }
       }
+      if(!ok) rejected++;
+      cands.set(t, found);
+    }
+    // If Tidal rejected every search, something is wrong with the request itself, not the songs.
+    // Stop without marking anything as "not found" so a fixed version can try again.
+    if(todo.length && rejected === todo.length){
+      const e = new Error("Tidal rejected every search (" + (lastErr ? lastErr.message : "unknown error") + ")");
+      e.status = lastErr && lastErr.status; throw e;
     }
     // Check the candidates' real titles and artists before accepting one
     const ids = [...new Set([...cands.values()].flat())];
@@ -737,6 +758,9 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
   });
   // Export every track (ignores "Hide bought" and grouping), in playlist order.
   // Columns match what the paste/upload parser reads, so the file can be loaded back in.
+  $("retryMiss").addEventListener("click", () => {
+    tracks.forEach(t => delete t.noMatch); saveList(); showNoMatch(); toolSay("Those songs will be searched again on your next run.");
+  });
   $("getCovers").addEventListener("click", () => runTool($("getCovers"), getCovers));
   $("makePl").addEventListener("click", () => runTool($("makePl"), makePlaylist));
   $("csv").addEventListener("click", () => {
