@@ -71,6 +71,12 @@ details[open] summary{margin-bottom:12px}
 ul.list{list-style:none; margin:0; padding:0}
 .group{margin:18px 0 6px; display:flex; justify-content:space-between; gap:10px; align-items:baseline; flex-wrap:wrap}
 .group strong{font-family:"Bricolage Grotesque",system-ui,sans-serif; font-size:1.05rem}
+.group .by{color:var(--muted); font-size:15px; font-weight:400; margin-left:6px}
+.group.artist-head{margin-top:28px; padding-bottom:6px; border-bottom:2px solid var(--ink)}
+.group.artist-head strong{font-size:1.25rem}
+.group.sub{margin:14px 0 2px; padding-left:12px; border-left:3px solid var(--teal)}
+.group.sub strong{font-size:1rem}
+.toggles select{width:auto; padding:6px 10px; font-size:15px}
 .group a, .links a{color:var(--pink); font-weight:700; text-underline-offset:3px}
 .item{display:grid; grid-template-columns:auto 1fr; gap:4px 12px; align-items:start; padding:12px 0; border-bottom:1.5px dashed var(--line)}
 .item input{width:22px; height:22px; margin-top:3px; accent-color:var(--teal); cursor:pointer}
@@ -141,7 +147,14 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
     <div class="toolbar">
       <div class="count" id="h-count"></div>
       <div class="toggles">
-        <label><input type="checkbox" id="byAlbum"> Group by album</label>
+        <label>Group by
+          <select id="groupBy">
+            <option value="none">Nothing</option>
+            <option value="album">Album</option>
+            <option value="artist">Artist</option>
+            <option value="artistAlbum">Artist, then album</option>
+          </select>
+        </label>
         <label><input type="checkbox" id="hideDone"> Hide bought</label>
       </div>
     </div>
@@ -182,11 +195,11 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
       tracks = Array.isArray(s.tracks) ? s.tracks : [];
       bought = s.bought && typeof s.bought === "object" ? s.bought : {};
       label = s.label || "";
-      $("byAlbum").checked = !!s.byAlbum; $("hideDone").checked = !!s.hideDone;
+      $("groupBy").value = ["none","album","artist","artistAlbum"].includes(s.groupBy) ? s.groupBy : (s.byAlbum ? "album" : "none"); $("hideDone").checked = !!s.hideDone;
     }catch(e){ tracks = []; bought = {}; }
   }
   function saveList(){
-    store.set(KEY, JSON.stringify({tracks, bought, label, byAlbum:$("byAlbum").checked, hideDone:$("hideDone").checked}));
+    store.set(KEY, JSON.stringify({tracks, bought, label, groupBy:$("groupBy").value, hideDone:$("hideDone").checked}));
   }
 
   /* ---------- PKCE helpers ---------- */
@@ -405,16 +418,48 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
   const link = (href, text) => '<a href="' + href + '" target="_blank" rel="noopener">' + text + '</a>';
   const firstArtist = s => (s || "").split(", ")[0];
 
+  // What the group headers already show, so items don't repeat it
   function itemHTML(t){
+    const mode = $("groupBy").value;
+    const albumInHead = mode === "album" || mode === "artistAlbum";
+    const artistInHead = mode === "artist" || mode === "artistAlbum";
     const id = idOf(t), done = !!bought[id], a = firstArtist(t.artist);
     let links = link(bc((a ? a + " " : "") + t.title, "t"), "Find track");
-    if(t.album && !$("byAlbum").checked) links += link(bc((a ? a + " " : "") + t.album, "a"), "Find album");
-    if(a) links += link(bc(a, "b"), "Artist page");
+    if(t.album && !albumInHead) links += link(bc((a ? a + " " : "") + t.album, "a"), "Find album");
+    if(a && !artistInHead) links += link(bc(a, "b"), "Artist page");
+    // Under an artist header, still show the full credit if there are featured artists
+    const showArtist = t.artist && !(artistInHead && t.artist === a);
+    const sub = [showArtist ? t.artist : "", t.album && !albumInHead ? t.album : ""].filter(Boolean).join(" · ");
     return '<li class="item' + (done ? " done" : "") + '">' +
       '<input type="checkbox" data-id="' + esc(id) + '"' + (done ? " checked" : "") + ' aria-label="Bought ' + esc(t.title) + '">' +
       '<div><div class="title">' + esc(t.title) + '</div>' +
-      (t.artist ? '<div class="artist">' + esc(t.artist) + (t.album && !$("byAlbum").checked ? " · " + esc(t.album) : "") + '</div>' : "") +
+      (sub ? '<div class="artist">' + esc(sub) + '</div>' : "") +
       '</div><div class="links">' + links + '</div></li>';
+  }
+
+  // Group a list by key, A to Z, with the "none" bucket last
+  function groupBy(list, keyFn){
+    const groups = new Map();
+    list.forEach(t => { const k = keyFn(t); if(!groups.has(k)) groups.set(k, []); groups.get(k).push(t); });
+    return [...groups.entries()].sort((x, y) => {
+      if(x[0] === "") return 1; if(y[0] === "") return -1;
+      return x[0].localeCompare(y[0], undefined, {sensitivity:"base"});
+    });
+  }
+  const artistKey = t => firstArtist(t.artist).toLowerCase();
+  const albumKey = t => t.album ? (t.album + "|" + firstArtist(t.artist)).toLowerCase() : "";
+
+  function albumHead(t0, cls, withArtist){
+    const a = firstArtist(t0.artist);
+    return '<li class="group' + cls + '"><span><strong>' + esc(t0.album || "No album listed") + '</strong>' +
+      (withArtist && a && t0.album ? '<span class="by">' + esc(a) + '</span>' : "") + '</span>' +
+      (t0.album ? link(bc((a ? a + " " : "") + t0.album, "a"), "Find album") : "") + '</li>';
+  }
+  function artistHead(t0, count){
+    const a = firstArtist(t0.artist);
+    return '<li class="group artist-head"><span><strong>' + esc(a || "No artist listed") + '</strong>' +
+      '<span class="by">' + count + (count === 1 ? " track" : " tracks") + '</span></span>' +
+      (a ? link(bc(a, "b"), "Artist page") : "") + '</li>';
   }
 
   function render(){
@@ -426,17 +471,19 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
     const hide = $("hideDone").checked;
     const visible = tracks.filter(t => !(hide && bought[idOf(t)]));
     if(!visible.length){ $("list").innerHTML = '<li class="empty">Everything here is bought. Nice work.</li>'; return; }
-    if($("byAlbum").checked){
-      const groups = new Map();
-      visible.forEach(t => { const k = t.album ? t.album + "|" + firstArtist(t.artist) : "|none"; if(!groups.has(k)) groups.set(k, []); groups.get(k).push(t); });
-      let html = "";
-      groups.forEach(list => {
-        const t0 = list[0], a = firstArtist(t0.artist);
-        html += '<li class="group"><strong>' + esc(t0.album || "No album listed") + '</strong>' +
-          (t0.album ? link(bc((a ? a + " " : "") + t0.album, "a"), "Find album") : "") + '</li>' + list.map(itemHTML).join("");
+    const mode = $("groupBy").value;
+    let html = "";
+    if(mode === "album"){
+      groupBy(visible, albumKey).forEach(([, list]) => { html += albumHead(list[0], "", true) + list.map(itemHTML).join(""); });
+    } else if(mode === "artist"){
+      groupBy(visible, artistKey).forEach(([, list]) => { html += artistHead(list[0], list.length) + list.map(itemHTML).join(""); });
+    } else if(mode === "artistAlbum"){
+      groupBy(visible, artistKey).forEach(([, list]) => {
+        html += artistHead(list[0], list.length);
+        groupBy(list, albumKey).forEach(([, albums]) => { html += albumHead(albums[0], " sub", false) + albums.map(itemHTML).join(""); });
       });
-      $("list").innerHTML = html;
-    } else $("list").innerHTML = visible.map(itemHTML).join("");
+    } else html = visible.map(itemHTML).join("");
+    $("list").innerHTML = html;
   }
 
   function setTracks(list, name){
@@ -479,7 +526,7 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
     if(e.target.checked) bought[id] = true; else delete bought[id];
     saveList(); render();
   });
-  $("byAlbum").addEventListener("change", () => { saveList(); render(); });
+  $("groupBy").addEventListener("change", () => { saveList(); render(); });
   $("hideDone").addEventListener("change", () => { saveList(); render(); });
 
   /* ---------- Start ---------- */
