@@ -69,7 +69,11 @@ details[open] summary{margin-bottom:12px}
 .bar{height:8px; background:var(--line); border-radius:999px; overflow:hidden; margin-bottom:14px}
 .bar i{display:block; height:100%; width:0; background:var(--teal); transition:width .3s}
 ul.list{list-style:none; margin:0; padding:0}
-.group{margin:18px 0 6px; display:flex; justify-content:space-between; gap:10px; align-items:baseline; flex-wrap:wrap}
+.group{margin:18px 0 6px; display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap}
+.group .head{display:flex; gap:12px; align-items:center; min-width:0}
+.cover{flex:none; display:block; object-fit:cover; background:var(--soft); border:1.5px solid var(--line); border-radius:6px}
+.cover.lg{width:64px; height:64px}
+.cover.sm{width:48px; height:48px; margin-top:2px}
 .group strong{font-family:"Bricolage Grotesque",system-ui,sans-serif; font-size:1.05rem}
 .group .by{color:var(--muted); font-size:15px; font-weight:400; margin-left:6px}
 .group.artist-head{margin-top:28px; padding-bottom:6px; border-bottom:2px solid var(--ink)}
@@ -79,6 +83,9 @@ ul.list{list-style:none; margin:0; padding:0}
 .toggles select{width:auto; padding:6px 10px; font-size:15px}
 .group a, .links a{color:var(--pink); font-weight:700; text-underline-offset:3px}
 .item{display:grid; grid-template-columns:auto 1fr; gap:4px 12px; align-items:start; padding:12px 0; border-bottom:1.5px dashed var(--line)}
+.item.art{grid-template-columns:auto 48px 1fr}
+.item.art .links{grid-column:3}
+.item.done .cover{opacity:.5}
 .item input{width:22px; height:22px; margin-top:3px; accent-color:var(--teal); cursor:pointer}
 .title{font-weight:700; overflow-wrap:anywhere}
 .artist{color:var(--muted); font-size:15px; overflow-wrap:anywhere}
@@ -160,7 +167,7 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
     </div>
     <div class="bar" aria-hidden="true"><i id="bar"></i></div>
     <ul class="list" id="list"></ul>
-    <div class="row"><button class="link" id="clear">Clear this list</button></div>
+    <div class="row"><button id="csv">Download CSV</button><button class="link" id="clear">Clear this list</button></div>
   </section>
 
   <footer>Searches open on bandcamp.com. Not every track is sold there, especially major-label releases, so some searches will come up empty. Buying on a Bandcamp Friday sends more to the artist.</footer>
@@ -325,11 +332,10 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
       say("Loading tracks…");
       const progress = n => say("Loading tracks… " + n + " so far");
       let res;
-      try{
-        res = await allPages("/playlists/" + id + "/relationships/items", {countryCode:country, include:"items,items.artists,items.albums"}, progress);
-      }catch(e){
-        if(e.status !== 400) throw e;
-        res = await allPages("/playlists/" + id + "/relationships/items", {countryCode:country, include:"items,items.artists"}, progress);
+      const includes = ["items,items.artists,items.albums,items.albums.coverArt", "items,items.artists,items.albums", "items,items.artists"];
+      for(let i = 0; i < includes.length; i++){
+        try{ res = await allPages("/playlists/" + id + "/relationships/items", {countryCode:country, include:includes[i]}, progress); break; }
+        catch(e){ if(e.status !== 400 || i === includes.length - 1) throw e; }
       }
       const inc = new Map(res.included.map(x => [x.type + ":" + x.id, x]));
       const list = [];
@@ -343,16 +349,55 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
         list.push({
           title: (a.title || "Untitled") + (a.version ? " (" + a.version + ")" : ""),
           artist: artists.join(", "),
-          album: alb ? alb.attributes.title : ""
+          album: alb ? alb.attributes.title : "",
+          albumId: albRef ? albRef.id : "",
+          cover: coverOf(alb, inc)
         });
       });
       if(!list.length){ say("That playlist has no tracks Tidal could share.", true); return; }
       setTracks(list, name || "Tidal playlist");
+      fillCovers();
     }catch(e){
       say(e.status === 404 ? "Couldn't find that playlist. Private playlists only load if they're yours." : "Couldn't load that playlist: " + e.message, true);
     }finally{
       document.querySelectorAll("#playlists button").forEach(b => b.disabled = false);
     }
+  }
+
+  /* ---------- Album covers ---------- */
+  // Pick the smallest image that's still sharp at 64px on a high-density screen
+  function pickArt(files){
+    const list = (files || []).filter(f => f && f.href)
+      .sort((a, b) => ((a.meta && a.meta.width) || 0) - ((b.meta && b.meta.width) || 0));
+    const f = list.find(f => ((f.meta && f.meta.width) || 0) >= 160) || list[list.length - 1];
+    return f ? f.href : "";
+  }
+  // Works with both shapes Tidal returns: imageLinks on the album, or a coverArt -> artworks relationship
+  function coverOf(alb, inc){
+    if(!alb) return "";
+    const a = alb.attributes || {};
+    if(a.imageLinks && a.imageLinks.length) return pickArt(a.imageLinks);
+    const r = alb.relationships && alb.relationships.coverArt && alb.relationships.coverArt.data;
+    const art = r && r[0] && inc.get("artworks:" + r[0].id);
+    return art ? pickArt(art.attributes && art.attributes.files) : "";
+  }
+  // Backup: look up covers for any albums the playlist request didn't include them for
+  async function fillCovers(){
+    const need = [...new Set(tracks.filter(t => t.albumId && !t.cover).map(t => t.albumId))];
+    if(!need.length) return;
+    const found = {};
+    for(let i = 0; i < need.length; i += 20){
+      const p = new URLSearchParams({countryCode:country, include:"coverArt"});
+      need.slice(i, i + 20).forEach(id => p.append("filter[id]", id));
+      try{
+        const j = await api("/albums", p);
+        const inc = new Map((j.included || []).map(x => [x.type + ":" + x.id, x]));
+        (j.data || []).forEach(a => { const c = coverOf(a, inc); if(c) found[a.id] = c; });
+      }catch(e){ break; }
+    }
+    let changed = false;
+    tracks.forEach(t => { if(!t.cover && found[t.albumId]){ t.cover = found[t.albumId]; changed = true; } });
+    if(changed){ saveList(); render(); }
   }
 
   /* ---------- Steps ---------- */
@@ -418,20 +463,27 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
   const link = (href, text) => '<a href="' + href + '" target="_blank" rel="noopener">' + text + '</a>';
   const firstArtist = s => (s || "").split(", ")[0];
 
+  const coverImg = (src, size) => src
+    ? '<img class="cover ' + size + '" src="' + esc(src) + '" alt="" loading="lazy" decoding="async" onerror="this.removeAttribute(\'src\')">'
+    : '<span class="cover ' + size + '" aria-hidden="true"></span>';
+  let showArt = false; // set in render(): only when this list has any covers at all
+
   // What the group headers already show, so items don't repeat it
   function itemHTML(t){
     const mode = $("groupBy").value;
     const albumInHead = mode === "album" || mode === "artistAlbum";
     const artistInHead = mode === "artist" || mode === "artistAlbum";
     const id = idOf(t), done = !!bought[id], a = firstArtist(t.artist);
+    const thumb = showArt && !albumInHead; // album headers carry the cover instead
     let links = link(bc((a ? a + " " : "") + t.title, "t"), "Find track");
     if(t.album && !albumInHead) links += link(bc((a ? a + " " : "") + t.album, "a"), "Find album");
     if(a && !artistInHead) links += link(bc(a, "b"), "Artist page");
     // Under an artist header, still show the full credit if there are featured artists
     const showArtist = t.artist && !(artistInHead && t.artist === a);
     const sub = [showArtist ? t.artist : "", t.album && !albumInHead ? t.album : ""].filter(Boolean).join(" · ");
-    return '<li class="item' + (done ? " done" : "") + '">' +
+    return '<li class="item' + (done ? " done" : "") + (thumb ? " art" : "") + '">' +
       '<input type="checkbox" data-id="' + esc(id) + '"' + (done ? " checked" : "") + ' aria-label="Bought ' + esc(t.title) + '">' +
+      (thumb ? coverImg(t.cover, "sm") : "") +
       '<div><div class="title">' + esc(t.title) + '</div>' +
       (sub ? '<div class="artist">' + esc(sub) + '</div>' : "") +
       '</div><div class="links">' + links + '</div></li>';
@@ -449,10 +501,11 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
   const artistKey = t => firstArtist(t.artist).toLowerCase();
   const albumKey = t => t.album ? (t.album + "|" + firstArtist(t.artist)).toLowerCase() : "";
 
-  function albumHead(t0, cls, withArtist){
-    const a = firstArtist(t0.artist);
-    return '<li class="group' + cls + '"><span><strong>' + esc(t0.album || "No album listed") + '</strong>' +
-      (withArtist && a && t0.album ? '<span class="by">' + esc(a) + '</span>' : "") + '</span>' +
+  function albumHead(list, cls, withArtist){
+    const t0 = list[0], a = firstArtist(t0.artist);
+    const cover = showArt ? coverImg((list.find(t => t.cover) || t0).cover, "lg") : "";
+    return '<li class="group' + cls + '"><span class="head">' + cover + '<span><strong>' + esc(t0.album || "No album listed") + '</strong>' +
+      (withArtist && a && t0.album ? '<span class="by">' + esc(a) + '</span>' : "") + '</span></span>' +
       (t0.album ? link(bc((a ? a + " " : "") + t0.album, "a"), "Find album") : "") + '</li>';
   }
   function artistHead(t0, count){
@@ -472,15 +525,16 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
     const visible = tracks.filter(t => !(hide && bought[idOf(t)]));
     if(!visible.length){ $("list").innerHTML = '<li class="empty">Everything here is bought. Nice work.</li>'; return; }
     const mode = $("groupBy").value;
+    showArt = tracks.some(t => t.cover);
     let html = "";
     if(mode === "album"){
-      groupBy(visible, albumKey).forEach(([, list]) => { html += albumHead(list[0], "", true) + list.map(itemHTML).join(""); });
+      groupBy(visible, albumKey).forEach(([, list]) => { html += albumHead(list, "", true) + list.map(itemHTML).join(""); });
     } else if(mode === "artist"){
       groupBy(visible, artistKey).forEach(([, list]) => { html += artistHead(list[0], list.length) + list.map(itemHTML).join(""); });
     } else if(mode === "artistAlbum"){
       groupBy(visible, artistKey).forEach(([, list]) => {
         html += artistHead(list[0], list.length);
-        groupBy(list, albumKey).forEach(([, albums]) => { html += albumHead(albums[0], " sub", false) + albums.map(itemHTML).join(""); });
+        groupBy(list, albumKey).forEach(([, albums]) => { html += albumHead(albums, " sub", false) + albums.map(itemHTML).join(""); });
       });
     } else html = visible.map(itemHTML).join("");
     $("list").innerHTML = html;
@@ -516,6 +570,28 @@ footer{color:var(--muted); font-size:14px; margin-top:36px}
     r.onload = () => { $("input").value = r.result; setTracks(parse(r.result), f.name.replace(/\.\w+$/, "")); };
     r.onerror = () => say("Couldn't read that file. Try pasting its contents instead.", true);
     r.readAsText(f); e.target.value = "";
+  });
+  // Export every track (ignores "Hide bought" and grouping), in playlist order.
+  // Columns match what the paste/upload parser reads, so the file can be loaded back in.
+  $("csv").addEventListener("click", () => {
+    if(!tracks.length) return;
+    const cell = v => { v = String(v == null ? "" : v); return /[",\r\n]/.test(v) || /^\s|\s$/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+    const rows = [["Title", "Artist", "Album", "Bought", "Bandcamp track search", "Bandcamp album search", "Bandcamp artist search"]];
+    tracks.forEach(t => {
+      const a = firstArtist(t.artist);
+      rows.push([
+        t.title, t.artist, t.album || "", bought[idOf(t)] ? "Yes" : "No",
+        bc((a ? a + " " : "") + t.title, "t"),
+        t.album ? bc((a ? a + " " : "") + t.album, "a") : "",
+        a ? bc(a, "b") : ""
+      ]);
+    });
+    const csv = "\uFEFF" + rows.map(r => r.map(cell).join(",")).join("\r\n");
+    const name = ((label || "tracks").replace(/[\\/:*?"<>|]+/g, "").trim() || "tracks") + ".csv";
+    const url = URL.createObjectURL(new Blob([csv], {type:"text/csv;charset=utf-8"}));
+    const a = document.createElement("a");
+    a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   });
   $("clear").addEventListener("click", () => {
     if(!confirm("Clear this list and your bought ticks?")) return;
